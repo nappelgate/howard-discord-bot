@@ -1,0 +1,14 @@
+services:
+  chaosbot:
+    build: .
+    container_name: chaos-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Overrides whatever FFMPEG_PATH is in .env (e.g. a Windows path) —
+      # inside the container ffmpeg is simply on PATH.
+      FFMPEG_PATH: ffmpeg
+    volumes:
+      # Drop new audio into ./sounds on the host; the bot sees it live.
+      - ./sounds:/app/sounds
