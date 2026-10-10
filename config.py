@@ -6,7 +6,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
+# ENV_FILE lets a second bot (Son of Howard) run this same codebase with its own settings.
+ENV_FILE = Path(os.getenv("ENV_FILE") or BASE_DIR / ".env")
+load_dotenv(ENV_FILE)
 
 
 def _float(name: str, default: float) -> float:
@@ -67,6 +69,24 @@ class Settings:
 
         # Optional: restrict the bot to specific guild IDs (comma-separated).
         self.guild_allowlist = _id_set("GUILD_ALLOWLIST")
+
+        # Top-level slash command group name (/howard by default).
+        self.command_group = os.getenv("COMMAND_GROUP", "howard").strip() or "howard"
+
+        # Background jobs that should only run on one bot when two share this codebase.
+        self.enable_join_sounds = _bool("ENABLE_JOIN_SOUNDS", True)
+        self.enable_tiktok_sync = _bool("ENABLE_TIKTOK_SYNC", True)
+        self.enable_library_seed = _bool("ENABLE_LIBRARY_SEED", True)
+
+        # message_content + members are privileged; a bot without them enabled
+        # in the Developer Portal must set this false or login fails.
+        self.privileged_intents = _bool("PRIVILEGED_INTENTS", True)
+
+        # Follow another bot (Howard) into voice: when it joins a channel, raid
+        # that channel too with this probability.
+        _follow_raw = os.getenv("FOLLOW_BOT_ID", "").strip()
+        self.follow_bot_id: int | None = int(_follow_raw) if _follow_raw.isdigit() else None
+        self.follow_chance = _float("FOLLOW_CHANCE", 0.05)
 
         # Owner's Discord user ID — gates privileged commands.
         _owner_raw = os.getenv("OWNER_ID", "").strip()

@@ -2,6 +2,7 @@
 a random sound, then leave. Also: gaslight users in text chat."""
 
 import asyncio
+import collections
 import io
 import json
 import logging
@@ -20,7 +21,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import settings
+from config import ENV_FILE, settings
 
 log = logging.getLogger("chaosbot.voice")
 
@@ -93,10 +94,18 @@ _BUILTIN_TRUTHS: list[str] = [
 # Per-sound metadata: who added it and when.
 _SOUNDS_META_PATH = Path(__file__).parent.parent / "data" / "sounds_meta.json"
 
+# Music saved library (written by music.py's /howard music save).
+_MUSIC_SAVED_PATH = Path(__file__).parent.parent / "data" / "music_saved.json"
+
 # Council submissions: user-uploaded images (+ optional caption) used in random replies.
 _COUNCIL_PATH = Path(__file__).parent.parent / "data" / "council.json"
 _COUNCIL_DIR = Path(__file__).parent.parent / "data" / "council"
 _COUNCIL_GUILD = "obama means family"
+
+# TikTok playlist auto-sync: poll this collection every N seconds for new videos.
+_TIKTOK_PLAYLIST_URL = "https://www.tiktok.com/@nappelgate/collection/howard-7657729392981986062"
+_TIKTOK_SEEN_PATH = Path(__file__).parent.parent / "data" / "tiktok_seen.json"
+_TIKTOK_POLL_INTERVAL = 4 * 60 * 60  # 4 hours
 
 # Join-sound pool: one is picked at random whenever someone joins the target channel.
 # trim_last_secs: download only the last N seconds; None = full clip.
@@ -416,399 +425,17 @@ class AmendmentModal(discord.ui.Modal, title="Amend Council Entry"):
         )
 
 
-class CouncilGroup(app_commands.Group):
-    """Subgroup managing the council — Howard's random-reply content bank."""
-
-    def __init__(self, bot: commands.Bot) -> None:
-        super().__init__(name="council", description="Submit content for Howard to deploy as random replies.")
-        self.bot = bot
-
-    @staticmethod
-    def _is_valid(e: dict) -> bool:
-        return bool(
-            e.get("video_url")
-            or (e.get("reply_text") and e.get("captions"))
-            or (e.get("path") and Path(e["path"]).exists())
-        )
-
-    @staticmethod
-    def _entry_label(i: int, e: dict) -> str:
-        kind = "[img]" if e.get("path") else ("[vid]" if e.get("video_url") else "[txt]")
-        first = (e.get("captions") or [None])[0] or ""
-        label = f"#{i} {kind} {e.get('submitted_by', '?')}"
-        if first:
-            label += f" — {first[:40]}"
-        return label[:100]
-
-    @staticmethod
-    def _guild_check(interaction: discord.Interaction) -> bool:
-        return bool(interaction.guild and interaction.guild.name == _COUNCIL_GUILD)
-
-    # ── /howard council image ─────────────────────────────────────────────────
-
-    @app_commands.command(name="image", description="Submit an image for Howard to deploy as a random reply.")
-    @app_commands.describe(
-        image="Primary image to submit.",
-        image2="Optional paired image — always posted directly below the primary.",
-        caption="Caption 1.",
-        caption2="Caption 2.",
-        caption3="Caption 3.",
-        caption4="Caption 4.",
-        caption5="Caption 5.",
-        keywords="Comma-separated keywords. Prioritized when Howard replies to a matching message.",
-    )
-    async def image_cmd(
-        self, interaction: discord.Interaction,
-        image: discord.Attachment,
-        image2: discord.Attachment | None = None,
-        caption: str = "", caption2: str = "", caption3: str = "",
-        caption4: str = "", caption5: str = "",
-        keywords: str = "",
-    ) -> None:
-        if not self._guild_check(interaction):
-            await interaction.response.send_message("Council is not available in this server.", ephemeral=True)
-            return
-        await self._save_image(
-            interaction, image, image2=image2,
-            captions=[caption, caption2, caption3, caption4, caption5],
-            keywords=keywords,
-        )
-
-    async def _save_image(
-        self,
-        interaction: discord.Interaction,
-        image: discord.Attachment,
-        image2: discord.Attachment | None,
-        captions: list[str],
-        keywords: str,
-        target_user_ids: list[str] | None = None,
-        target_role_ids: list[str] | None = None,
-    ) -> None:
-        if not image.content_type or not image.content_type.startswith("image/"):
-            await interaction.response.send_message(
-                "That doesn't look like an image. Please attach a PNG, JPG, GIF, or WEBP.", ephemeral=True,
-            )
-            return
-        if image2 and (not image2.content_type or not image2.content_type.startswith("image/")):
-            await interaction.response.send_message("The paired image doesn't look like an image.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        entry_id = f"{int(time.time())}_{interaction.user.id}"
-        ext = Path(image.filename).suffix.lower() or ".png"
-        dest = _COUNCIL_DIR / f"{entry_id}{ext}"
-        _COUNCIL_DIR.mkdir(parents=True, exist_ok=True)
-
-        try:
-            await image.save(dest)
-        except Exception as exc:
-            log.exception("Failed to save council image.")
-            await interaction.followup.send(f"❌ Failed to save image: {exc}", ephemeral=True)
-            return
-
-        paired_path: str | None = None
-        if image2:
-            ext2 = Path(image2.filename).suffix.lower() or ".png"
-            dest2 = _COUNCIL_DIR / f"{entry_id}_pair{ext2}"
-            try:
-                await image2.save(dest2)
-                paired_path = str(dest2)
-            except Exception as exc:
-                log.exception("Failed to save paired council image.")
-                await interaction.followup.send(f"❌ Failed to save paired image: {exc}", ephemeral=True)
-                return
-
-        clean_captions = [c.strip() for c in captions if c.strip()]
-        clean_keywords = [k.strip().lower() for k in keywords.split(",") if k.strip()]
-        data = _council_load()
-        entry: dict = {
-            "id": entry_id,
-            "path": str(dest),
-            "captions": clean_captions,
-            "keywords": clean_keywords,
-            "target_users": target_user_ids or [],
-            "target_roles": target_role_ids or [],
-            "submitted_by": interaction.user.display_name,
-            "submitted_at": int(time.time()),
-        }
-        if paired_path:
-            entry["paired_path"] = paired_path
-        data.append(entry)
-        _council_save(data)
-        cap_note = f" with {len(clean_captions)} caption(s)" if clean_captions else ""
-        kw_note = f" and {len(clean_keywords)} keyword(s)" if clean_keywords else ""
-        pair_note = " + paired image" if paired_path else ""
-        log.info("Council image #%d from %s%s%s%s.", len(data), interaction.user.display_name, cap_note, kw_note, pair_note)
-        await interaction.followup.send(
-            f"✅ Image submitted{cap_note}{kw_note}{pair_note}. Council has **{len(data)}** submission(s).",
-            ephemeral=True,
-        )
-
-    # ── /howard council video ─────────────────────────────────────────────────
-
-    @app_commands.command(name="video", description="Submit a YouTube link for Howard to deploy as a random reply.")
-    @app_commands.describe(
-        url="YouTube URL to submit.",
-        caption="Caption 1.",
-        caption2="Caption 2.",
-        caption3="Caption 3.",
-        caption4="Caption 4.",
-        caption5="Caption 5.",
-        keywords="Comma-separated keywords. Prioritized when Howard replies to a matching message.",
-    )
-    async def video_cmd(
-        self, interaction: discord.Interaction,
-        url: str,
-        caption: str = "", caption2: str = "", caption3: str = "",
-        caption4: str = "", caption5: str = "",
-        keywords: str = "",
-    ) -> None:
-        if not self._guild_check(interaction):
-            await interaction.response.send_message("Council is not available in this server.", ephemeral=True)
-            return
-        if not re.match(r"^https?://(?:www\.|m\.)?(?:youtube\.com/|youtu\.be/)", url, re.IGNORECASE):
-            await interaction.response.send_message("Please provide a valid YouTube URL.", ephemeral=True)
-            return
-        clean_captions = [c.strip() for c in [caption, caption2, caption3, caption4, caption5] if c.strip()]
-        clean_keywords = [k.strip().lower() for k in keywords.split(",") if k.strip()]
-        data = _council_load()
-        entry_id = f"{int(time.time())}_{interaction.user.id}"
-        entry: dict = {
-            "id": entry_id,
-            "video_url": url.strip(),
-            "captions": clean_captions,
-            "keywords": clean_keywords,
-            "target_users": [],
-            "target_roles": [],
-            "submitted_by": interaction.user.display_name,
-            "submitted_at": int(time.time()),
-        }
-        data.append(entry)
-        _council_save(data)
-        cap_note = f" with {len(clean_captions)} caption(s)" if clean_captions else ""
-        kw_note = f" and {len(clean_keywords)} keyword(s)" if clean_keywords else ""
-        log.info("Council video #%d from %s%s%s.", len(data), interaction.user.display_name, cap_note, kw_note)
-        await interaction.response.send_message(
-            f"✅ Video submitted{cap_note}{kw_note}. Council has **{len(data)}** submission(s).",
-            ephemeral=True,
-        )
-
-    # ── /howard council text ──────────────────────────────────────────────────
-
-    @app_commands.command(name="text", description="Submit a text reply for Howard to use at random.")
-    @app_commands.describe(
-        text="The reply Howard will send. Add variants for random selection.",
-        text2="Alternate version 2.",
-        text3="Alternate version 3.",
-        text4="Alternate version 4.",
-        text5="Alternate version 5.",
-        keywords="Comma-separated keywords. Prioritized when Howard replies to a matching message.",
-    )
-    async def text_cmd(
-        self, interaction: discord.Interaction,
-        text: str,
-        text2: str = "", text3: str = "", text4: str = "", text5: str = "",
-        keywords: str = "",
-    ) -> None:
-        if not self._guild_check(interaction):
-            await interaction.response.send_message("Council is not available in this server.", ephemeral=True)
-            return
-        variants = [t.strip() for t in [text, text2, text3, text4, text5] if t.strip()]
-        clean_keywords = [k.strip().lower() for k in keywords.split(",") if k.strip()]
-        data = _council_load()
-        entry_id = f"{int(time.time())}_{interaction.user.id}"
-        entry: dict = {
-            "id": entry_id,
-            "reply_text": True,
-            "captions": variants,
-            "keywords": clean_keywords,
-            "target_users": [],
-            "target_roles": [],
-            "submitted_by": interaction.user.display_name,
-            "submitted_at": int(time.time()),
-        }
-        data.append(entry)
-        _council_save(data)
-        var_note = f" ({len(variants)} variant(s))" if len(variants) > 1 else ""
-        kw_note = f" with {len(clean_keywords)} keyword(s)" if clean_keywords else ""
-        log.info("Council text #%d from %s%s.", len(data), interaction.user.display_name, kw_note)
-        await interaction.response.send_message(
-            f"✅ Text submitted{var_note}{kw_note}. Council has **{len(data)}** submission(s).",
-            ephemeral=True,
-        )
-
-    # ── /howard council target ────────────────────────────────────────────────
-
-    @app_commands.command(name="target", description="Submit council content with user/role targeting.")
-    @app_commands.default_permissions()
-    @app_commands.describe(
-        image="Image to submit (provide one of: image, url, or text).",
-        image2="Optional paired image.",
-        url="YouTube URL to submit.",
-        text="Text reply to submit.",
-        caption="Caption 1.",
-        caption2="Caption 2.",
-        caption3="Caption 3.",
-        caption4="Caption 4.",
-        caption5="Caption 5.",
-        keywords="Comma-separated keywords.",
-        target_user="Deploy only to this user.",
-        target_user2="Deploy only to this user.",
-        target_user3="Deploy only to this user.",
-        target_role="Deploy only to members of this role.",
-        target_role2="Deploy only to members of this role.",
-    )
-    async def target_cmd(
-        self, interaction: discord.Interaction,
-        image: discord.Attachment | None = None,
-        image2: discord.Attachment | None = None,
-        url: str = "",
-        text: str = "",
-        caption: str = "", caption2: str = "", caption3: str = "",
-        caption4: str = "", caption5: str = "",
-        keywords: str = "",
-        target_user: discord.Member | None = None,
-        target_user2: discord.Member | None = None,
-        target_user3: discord.Member | None = None,
-        target_role: discord.Role | None = None,
-        target_role2: discord.Role | None = None,
-    ) -> None:
-        if settings.owner_id is None or interaction.user.id != settings.owner_id:
-            await interaction.response.send_message("Not authorized.", ephemeral=True)
-            return
-        if not self._guild_check(interaction):
-            await interaction.response.send_message("Council is not available in this server.", ephemeral=True)
-            return
-        target_user_ids = [str(u.id) for u in [target_user, target_user2, target_user3] if u]
-        target_role_ids = [str(r.id) for r in [target_role, target_role2] if r]
-
-        if image:
-            await self._save_image(
-                interaction, image, image2=image2,
-                captions=[caption, caption2, caption3, caption4, caption5],
-                keywords=keywords,
-                target_user_ids=target_user_ids,
-                target_role_ids=target_role_ids,
-            )
-        elif url.strip():
-            if not re.match(r"^https?://(?:www\.|m\.)?(?:youtube\.com/|youtu\.be/)", url, re.IGNORECASE):
-                await interaction.response.send_message("Please provide a valid YouTube URL.", ephemeral=True)
-                return
-            clean_captions = [c.strip() for c in [caption, caption2, caption3, caption4, caption5] if c.strip()]
-            clean_keywords = [k.strip().lower() for k in keywords.split(",") if k.strip()]
-            data = _council_load()
-            entry_id = f"{int(time.time())}_{interaction.user.id}"
-            entry: dict = {
-                "id": entry_id,
-                "video_url": url.strip(),
-                "captions": clean_captions,
-                "keywords": clean_keywords,
-                "target_users": target_user_ids,
-                "target_roles": target_role_ids,
-                "submitted_by": interaction.user.display_name,
-                "submitted_at": int(time.time()),
-            }
-            data.append(entry)
-            _council_save(data)
-            cap_note = f" with {len(clean_captions)} caption(s)" if clean_captions else ""
-            await interaction.response.send_message(
-                f"✅ Targeted video submitted{cap_note}. Council has **{len(data)}** submission(s).",
-                ephemeral=True,
-            )
-        elif text.strip():
-            clean_keywords = [k.strip().lower() for k in keywords.split(",") if k.strip()]
-            data = _council_load()
-            entry_id = f"{int(time.time())}_{interaction.user.id}"
-            entry: dict = {
-                "id": entry_id,
-                "reply_text": True,
-                "captions": [text.strip()],
-                "keywords": clean_keywords,
-                "target_users": target_user_ids,
-                "target_roles": target_role_ids,
-                "submitted_by": interaction.user.display_name,
-                "submitted_at": int(time.time()),
-            }
-            data.append(entry)
-            _council_save(data)
-            await interaction.response.send_message(
-                f"✅ Targeted text submitted. Council has **{len(data)}** submission(s).",
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                "Please provide an image, a YouTube URL, or text.", ephemeral=True,
-            )
-
-    # ── /howard council invoke ────────────────────────────────────────────────
-
-    @app_commands.command(name="invoke", description="Summon a submission from the council. Leave entry blank for random.")
-    @app_commands.describe(entry="Specific submission to post (leave blank for random).")
-    async def invoke_cmd(self, interaction: discord.Interaction, entry: str = "") -> None:
-        is_owner = settings.owner_id is not None and interaction.user.id == settings.owner_id
-        if entry and not is_owner:
-            entry = ""
-        if not self._guild_check(interaction):
-            await interaction.response.send_message("The council is not available in this server.", ephemeral=True)
-            return
-        council = _council_load()
-        valid = [e for e in council if self._is_valid(e)]
-        if not valid:
-            await interaction.response.send_message("The council has no submissions yet.", ephemeral=True)
-            return
-        if entry:
-            chosen = next((e for e in valid if e["id"] == entry), None)
-            if chosen is None:
-                await interaction.response.send_message("Entry not found.", ephemeral=True)
-                return
-        else:
-            chosen = random.choice(valid)
-        caption = _pick_council_caption(chosen)
-        if chosen.get("video_url"):
-            content = f"{caption}\n{chosen['video_url']}" if caption else chosen["video_url"]
-            await interaction.response.send_message(content=content)
-        elif chosen.get("reply_text"):
-            if not caption:
-                await interaction.response.send_message("That entry has no text.", ephemeral=True)
-                return
-            await interaction.response.send_message(content=caption)
-        else:
-            files = [discord.File(Path(chosen["path"]))]
-            paired = chosen.get("paired_path")
-            if paired and Path(paired).exists():
-                files.append(discord.File(Path(paired)))
-            await interaction.response.send_message(content=caption, files=files)
-
-    @invoke_cmd.autocomplete("entry")
-    async def _invoke_entry_autocomplete(
-        self, interaction: discord.Interaction, current: str
-    ) -> list[app_commands.Choice[str]]:
-        if settings.owner_id is None or interaction.user.id != settings.owner_id:
-            return []
-        council = _council_load()
-        choices = []
-        for i, e in enumerate(council, 1):
-            if not self._is_valid(e):
-                continue
-            label = self._entry_label(i, e)
-            if current.lower() not in label.lower():
-                continue
-            choices.append(app_commands.Choice(name=label, value=e["id"]))
-            if len(choices) >= 25:
-                break
-        return choices
-
-
 class VoiceChaos(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self._task: asyncio.Task | None = None
         self._gaslight_task: asyncio.Task | None = None
+        self._playlist_task: asyncio.Task | None = None
         self._start_time: float = time.monotonic()
         self._next_raid_at: float | None = None
         self._next_gaslight_at: float | None = None
         self._chill_until: float | None = None
+        self._recent_sounds: collections.deque[str] = collections.deque()
         self._webhook_cache: dict[int, discord.Webhook] = {}
         self._amend_ctx = app_commands.ContextMenu(
             name="Amend Council Entry",
@@ -849,7 +476,12 @@ class VoiceChaos(commands.Cog):
             self._gaslight_task = asyncio.create_task(self._gaslight_loop(), name="gaslight-loop")
         else:
             log.info("Gaslight loop disabled (ENABLE_GASLIGHT=false).")
-        asyncio.create_task(self._ensure_join_sounds(), name="join-sound-download")
+        if settings.enable_join_sounds:
+            asyncio.create_task(self._ensure_join_sounds(), name="join-sound-download")
+        if settings.enable_tiktok_sync:
+            self._playlist_task = asyncio.create_task(self._tiktok_playlist_loop(), name="tiktok-playlist-sync")
+        if settings.enable_library_seed:
+            asyncio.create_task(self._seed_sound_library(), name="sound-library-seed")
 
     async def _ensure_join_sounds(self) -> None:
         """Download and cache any join-sound clips not yet on disk."""
@@ -921,12 +553,92 @@ class VoiceChaos(commands.Cog):
             await self._normalize_audio(dest)
             log.info("Join sound '%s' cached at %s.", entry["name"], dest)
 
+    async def _tiktok_playlist_loop(self) -> None:
+        """Poll the hardcoded TikTok collection every _TIKTOK_POLL_INTERVAL seconds.
+        Downloads audio for any video not yet in the sounds library."""
+        await self.bot.wait_until_ready()
+        log.info("TikTok playlist sync armed (every %.0fh).", _TIKTOK_POLL_INTERVAL / 3600)
+        while not self.bot.is_closed():
+            try:
+                await self._sync_tiktok_playlist()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("TikTok playlist sync failed.")
+            await asyncio.sleep(_TIKTOK_POLL_INTERVAL)
+
+    async def _sync_tiktok_playlist(self) -> None:
+        loop = asyncio.get_event_loop()
+
+        def _load_seen() -> set[str]:
+            try:
+                return set(json.loads(_TIKTOK_SEEN_PATH.read_text()))
+            except (FileNotFoundError, json.JSONDecodeError):
+                return set()
+
+        def _save_seen(ids: set[str]) -> None:
+            _TIKTOK_SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _TIKTOK_SEEN_PATH.write_text(json.dumps(sorted(ids)))
+
+        def _list_playlist() -> list[dict]:
+            result = subprocess.run(
+                [_YTDLP_BIN,
+                 "--cookies-from-browser", "chrome",
+                 "--js-runtimes", f"node:{_NODE_BIN}",
+                 "--flat-playlist", "-j", "--quiet", "--no-warnings",
+                 _TIKTOK_PLAYLIST_URL],
+                capture_output=True, text=True, timeout=120,
+            )
+            entries = []
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        pass
+            return entries
+
+        entries = await loop.run_in_executor(None, _list_playlist)
+        if not entries:
+            log.warning("TikTok playlist returned no entries.")
+            return
+
+        seen = await loop.run_in_executor(None, _load_seen)
+        new_entries = [e for e in entries if str(e.get("id", "")) not in seen]
+        if not new_entries:
+            log.info("TikTok playlist: no new videos.")
+            return
+
+        log.info("TikTok playlist: %d new video(s) to download.", len(new_entries))
+        added, failed = 0, 0
+        for entry in new_entries:
+            video_id = str(entry.get("id", ""))
+            video_url = entry.get("url") or entry.get("webpage_url") or f"https://www.tiktok.com/@nappelgate/video/{video_id}"
+            title = entry.get("title") or entry.get("id") or "tiktok"
+            try:
+                dest = await self._download_sound(video_url, None, None, None)
+                self._record_sound_meta(dest, "tiktok-playlist")
+                seen.add(video_id)
+                await loop.run_in_executor(None, _save_seen, seen)
+                log.info("TikTok playlist: added '%s'.", dest.name)
+                added += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("TikTok playlist: skipped '%s' (%s).", title[:60], exc)
+                failed += 1
+
+        log.info("TikTok playlist sync done: %d added, %d failed.", added, failed)
+
     async def cog_unload(self) -> None:
         self.bot.tree.remove_command(self._amend_ctx.name, type=self._amend_ctx.type)
         if self._task:
             self._task.cancel()
         if self._gaslight_task:
             self._gaslight_task.cancel()
+        if self._playlist_task:
+            self._playlist_task.cancel()
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -936,9 +648,17 @@ class VoiceChaos(commands.Cog):
         after: discord.VoiceState,
     ) -> None:
         # Only fire on a join (not a move within the server or a leave).
-        if member.bot:
-            return
         if after.channel is None or after.channel == before.channel:
+            return
+        if member.bot:
+            if (
+                settings.follow_bot_id is not None
+                and member.id == settings.follow_bot_id
+                and random.random() < settings.follow_chance
+            ):
+                asyncio.create_task(self._follow_raid(after.channel), name="follow-raid")
+            return
+        if not settings.enable_join_sounds:
             return
         if member.guild.name != _JOIN_SOUND_GUILD:
             return
@@ -1099,8 +819,25 @@ class VoiceChaos(commands.Cog):
             log.info("Nobody's in a voice channel. The chaos waits.")
             return
         channel = random.choice(channels)
-        sound = random.choice(sounds)
+
+        # exclude recently played sounds; history window = ~20% of library, max 40
+        history_size = min(max(len(sounds) // 5, 1), 40)
+        self._recent_sounds = collections.deque(self._recent_sounds, maxlen=history_size)
+        pool = [s for s in sounds if s.name not in self._recent_sounds] or sounds
+        sound = random.choice(pool)
+        self._recent_sounds.append(sound.name)
+
         log.info("Raiding '%s' (%s) with '%s'.", channel.name, channel.guild.name, sound.name)
+        await self._play_clip(channel, sound)
+
+    async def _follow_raid(self, channel: discord.VoiceChannel) -> None:
+        """Tag along when the followed bot (Howard) joins a voice channel."""
+        await asyncio.sleep(random.uniform(1.0, 4.0))
+        sounds = self._list_sounds()
+        if not sounds or (self._chill_until and time.monotonic() < self._chill_until):
+            return
+        sound = random.choice(sounds)
+        log.info("Following into '%s' with '%s'.", channel.name, sound.name)
         await self._play_clip(channel, sound)
 
     async def _play_clip(self, channel: discord.VoiceChannel, sound: Path) -> bool:
@@ -1270,9 +1007,12 @@ class VoiceChaos(commands.Cog):
         _SOUNDS_META_PATH.parent.mkdir(parents=True, exist_ok=True)
         _SOUNDS_META_PATH.write_text(json.dumps(data, indent=2))
 
-    def _record_sound_meta(self, path: Path, added_by: str) -> None:
+    def _record_sound_meta(self, path: Path, added_by: str, added_by_id: str | None = None) -> None:
         data = self._load_sounds_meta()
-        data[path.name] = {"added_by": added_by, "added_at": int(time.time())}
+        entry: dict = {"added_by": added_by, "added_at": int(time.time())}
+        if added_by_id:
+            entry["added_by_id"] = added_by_id
+        data[path.name] = entry
         self._save_sounds_meta(data)
 
     # --- YouTube → sound download ----------------------------------------
@@ -1473,7 +1213,7 @@ class VoiceChaos(commands.Cog):
 
     @staticmethod
     def _write_env(key: str, value: str) -> None:
-        env_path = Path(__file__).parent.parent / ".env"
+        env_path = ENV_FILE
         text = env_path.read_text()
         new_line = f"{key}={value}"
         if re.search(rf"^{re.escape(key)}=", text, re.MULTILINE):
@@ -1511,8 +1251,8 @@ class VoiceChaos(commands.Cog):
     # --- slash commands (/howard ...) ------------------------------------
 
     chaos = app_commands.Group(
-        name="howard",
-        description="Howard bot controls.",
+        name=settings.command_group,
+        description=f"{settings.command_group.title()} bot controls.",
         guild_only=True,
     )
 
@@ -1563,7 +1303,35 @@ class VoiceChaos(commands.Cog):
                 break
         return choices
 
-    @chaos.command(name="discography", description="List every sound in the library.")
+    @chaos.command(name="discography", description="List every saved music link.")
+    async def discography_cmd(self, interaction: discord.Interaction) -> None:
+        try:
+            saved = json.loads(_MUSIC_SAVED_PATH.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            saved = []
+        if not saved:
+            await interaction.response.send_message(
+                "No saved music links yet. Use `/howard music save` to add one.", ephemeral=True
+            )
+            return
+        saved.sort(key=lambda e: e.get("added_at", 0), reverse=True)
+        col_name = max(len(e["name"]) for e in saved) + 2
+        header = f"{'NAME':<{col_name}} {'ADDED BY':<20} TIMESTAMP (UTC)   URL"
+        divider = "-" * max(len(header), 80)
+        rows = [f"MUSIC LIBRARY — {len(saved)} saved link(s)", divider, header, divider]
+        for e in saved:
+            added_by = e.get("added_by", "unknown")
+            ts = e.get("added_at")
+            timestamp = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if ts else "unknown"
+            rows.append(f"{e['name']:<{col_name}} {added_by:<20} {timestamp:<18} {e['url']}")
+        buf = io.BytesIO("\n".join(rows).encode())
+        await interaction.response.send_message(
+            f"**{len(saved)} saved music link(s):**",
+            file=discord.File(buf, filename="discography.txt"),
+            ephemeral=True,
+        )
+
+    @chaos.command(name="sounds", description="List every sound in the library.")
     async def sounds_cmd(self, interaction: discord.Interaction) -> None:
         sounds = self._list_sounds()
         if not sounds:
@@ -1572,12 +1340,11 @@ class VoiceChaos(commands.Cog):
             )
             return
         meta = self._load_sounds_meta()
-        # Sort by added_at descending (newest first); unknowns go to the end.
         sounds.sort(key=lambda p: meta.get(p.name, {}).get("added_at", 0), reverse=True)
         col = max(len(p.name) for p in sounds) + 2
         header = f"{'SOUND':<{col}}{'ADDED BY':<20}TIMESTAMP (UTC)"
         divider = "-" * (col + 40)
-        rows = [header, divider]
+        rows = [f"SOUNDS LIBRARY — {len(sounds)} sound(s)", divider, header, divider]
         for p in sounds:
             m = meta.get(p.name, {})
             added_by = m.get("added_by", "unknown")
@@ -1587,7 +1354,7 @@ class VoiceChaos(commands.Cog):
         buf = io.BytesIO("\n".join(rows).encode())
         await interaction.response.send_message(
             f"**{len(sounds)} sound(s):**",
-            file=discord.File(buf, filename="discography.txt"),
+            file=discord.File(buf, filename="sounds.txt"),
             ephemeral=True,
         )
 
@@ -1656,10 +1423,19 @@ class VoiceChaos(commands.Cog):
             await interaction.followup.send(f"❌ Couldn't add that sound: {reason}")
             return
 
-        self._record_sound_meta(dest, interaction.user.display_name)
+        self._record_sound_meta(dest, interaction.user.display_name, str(interaction.user.id))
         await interaction.followup.send(
             f"✅ Added **{dest.name}** to the library. Play it with `/howard play`."
         )
+        if interaction.guild:
+            asyncio.create_task(
+                self._post_to_council_thread(
+                    interaction.guild,
+                    "howard's sound library",
+                    f"✅ **{dest.name}** added by {interaction.user.mention}",
+                ),
+                name="sound-library-add",
+            )
 
     @chaos.command(
         name="normalize",
@@ -1687,6 +1463,144 @@ class VoiceChaos(commands.Cog):
             f"🔉 Normalized **{done}/{len(sounds)}** sound(s) to {LOUDNORM.split(':')[0]}."
         )
 
+    async def _post_criminal_offense(
+        self,
+        guild: discord.Guild,
+        sound_name: str,
+        added_by: str,
+        added_by_id: str | None,
+        deleted_by: discord.Member,
+    ) -> None:
+        forum = next(
+            (ch for ch in guild.channels
+             if isinstance(ch, discord.ForumChannel) and ch.name == "the-council"),
+            None,
+        )
+        if forum is None:
+            log.warning("Criminal offense: 'the-council' forum not found in %s.", guild.name)
+            return
+
+        submitter = f"<@{added_by_id}>" if added_by_id else f"**{added_by}**"
+        msg = (
+            f"ALERT!!  {sound_name}, A MOST CHERISHED MASTERPIECE GIFTED TO OUR GLORIOUS COUNCIL "
+            f"BY {submitter}, HAS BEEN FUCKING YEETED AT THE FILTHY, GIMPISH HANDS OF "
+            f"{deleted_by.mention}."
+        )
+
+        thread: discord.Thread | None = discord.utils.get(forum.threads, name="criminal offenses")
+        if thread is None:
+            try:
+                async for t in forum.archived_threads():
+                    if t.name.lower() == "criminal offenses":
+                        thread = t
+                        break
+            except discord.HTTPException:
+                pass
+
+        try:
+            if thread:
+                if thread.archived:
+                    await thread.edit(archived=False)
+                await thread.send(msg)
+            else:
+                await forum.create_thread(name="criminal offenses", content=msg)
+        except discord.HTTPException as exc:
+            log.warning("Criminal offense: failed to post: %s", exc)
+
+    async def _post_to_council_thread(
+        self, guild: discord.Guild, thread_name: str, msg: str,
+        file_paths: list[Path] | None = None,
+    ) -> None:
+        forum = next(
+            (ch for ch in guild.channels if isinstance(ch, discord.ForumChannel) and ch.name == "the-council"),
+            None,
+        )
+        if forum is None:
+            return
+        thread: discord.Thread | None = None
+        tname_lower = thread_name.lower()
+        for t in forum.threads:
+            if t.name.lower() == tname_lower:
+                thread = t
+                break
+        if thread is None:
+            try:
+                async for t in forum.archived_threads(limit=None):
+                    if t.name.lower() == tname_lower:
+                        thread = t
+                        break
+            except discord.HTTPException:
+                pass
+        files = [discord.File(p) for p in (file_paths or []) if p.exists()]
+        try:
+            if thread:
+                if thread.archived:
+                    await thread.edit(archived=False)
+                await thread.send(msg, files=files)
+            else:
+                await forum.create_thread(name=thread_name, content=msg, files=files)
+        except discord.HTTPException as exc:
+            log.warning("_post_to_council_thread(%s): failed: %s", thread_name, exc)
+
+    async def _seed_sound_library(self) -> None:
+        await self.bot.wait_until_ready()
+        guild = next(
+            (g for g in self.bot.guilds if g.name == "obama means family"),
+            None,
+        )
+        if guild is None:
+            return
+        forum = next(
+            (ch for ch in guild.channels if isinstance(ch, discord.ForumChannel) and ch.name == "the-council"),
+            None,
+        )
+        if forum is None:
+            return
+        thread_name = "howard's sound library"
+        tname_lower = thread_name.lower()
+        thread: discord.Thread | None = None
+        for t in forum.threads:
+            if t.name.lower() == tname_lower:
+                thread = t
+                break
+        if thread is None:
+            try:
+                async for t in forum.archived_threads(limit=None):
+                    if t.name.lower() == tname_lower:
+                        thread = t
+                        break
+            except discord.HTTPException:
+                pass
+        if thread is not None:
+            return  # already seeded
+        sounds = self._list_sounds()
+        if not sounds:
+            return
+        meta = self._load_sounds_meta()
+        lines = [f"**Howard's Sound Library** — {len(sounds)} sounds\n"]
+        for p in sounds:
+            m = meta.get(p.name, {})
+            added_by = m.get("added_by", "unknown")
+            lines.append(f"• {p.name}  (added by {added_by})")
+        chunks: list[str] = []
+        current = ""
+        for line in lines:
+            candidate = (current + "\n" + line).lstrip("\n")
+            if len(candidate) > 1900:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        try:
+            result = await forum.create_thread(name=thread_name, content=chunks[0])
+            new_thread = result.thread
+            for chunk in chunks[1:]:
+                await new_thread.send(chunk)
+        except discord.HTTPException as exc:
+            log.warning("_seed_sound_library: failed: %s", exc)
+
     @chaos.command(name="removesound", description="Remove a sound from the library.")
     @app_commands.describe(sound="Sound to remove.")
     @app_commands.check(_full_only)
@@ -1698,9 +1612,28 @@ class VoiceChaos(commands.Cog):
             )
             return
         name = match.name
+        meta = self._load_sounds_meta()
+        m = meta.get(name, {})
+        added_by = m.get("added_by", "")
+        added_by_id = m.get("added_by_id")
+
         match.unlink()
         log.info("Removed sound '%s' (by %s).", name, interaction.user)
         await interaction.response.send_message(f"🗑️ Removed **{name}**.", ephemeral=True)
+
+        _system = {"tiktok-playlist", "unknown", ""}
+        is_own = (
+            (added_by_id and added_by_id == str(interaction.user.id))
+            or (not added_by_id and added_by == interaction.user.display_name)
+        )
+        if not is_own and added_by not in _system and interaction.guild:
+            asyncio.create_task(
+                self._post_criminal_offense(
+                    interaction.guild, name, added_by, added_by_id,
+                    interaction.user,
+                ),
+                name="criminal-offense-alert",
+            )
 
     @removesound_cmd.autocomplete("sound")
     async def _removesound_autocomplete(
@@ -1778,6 +1711,15 @@ class VoiceChaos(commands.Cog):
             parts.append(f"renamed to **{match.name}**")
         summary = " and ".join(parts) or "no changes made"
         await interaction.followup.send(f"✅ **{old_name}** — {summary}.")
+        if interaction.guild and summary != "no changes made":
+            asyncio.create_task(
+                self._post_to_council_thread(
+                    interaction.guild,
+                    "council log: sound edits",
+                    f"✏️ **{old_name}** — {summary} (by {interaction.user.mention})",
+                ),
+                name="sound-edit-log",
+            )
 
     @editsound_cmd.autocomplete("sound")
     async def _editsound_autocomplete(
@@ -2119,15 +2061,430 @@ class VoiceChaos(commands.Cog):
             await interaction.followup.send(f"❌ Generation failed: {exc}", ephemeral=True)
             return
 
-        self._record_sound_meta(dest, interaction.user.display_name)
+        self._record_sound_meta(dest, interaction.user.display_name, str(interaction.user.id))
         voice_label = voice or (f"rvc:{rvc_models[0].stem}" if rvc_models else xtts_voices[0].stem)
         await interaction.followup.send(
             f"✅ Generated `{safe}.wav` using voice `{voice_label}` — now in the library.",
             ephemeral=True,
         )
 
+    # ── council helpers ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _council_is_valid(e: dict) -> bool:
+        return bool(
+            e.get("video_url")
+            or (e.get("reply_text") and e.get("captions"))
+            or (e.get("path") and Path(e["path"]).exists())
+        )
+
+    @staticmethod
+    def _council_entry_label(i: int, e: dict) -> str:
+        kind = "[img]" if e.get("path") else ("[vid]" if e.get("video_url") else "[txt]")
+        first = (e.get("captions") or [""])[0] or e.get("video_url", "")
+        label = f"#{i} {kind} {e.get('submitted_by', '?')}"
+        if first:
+            label += f" — {first[:40]}"
+        return label[:100]
+
+    @staticmethod
+    def _council_guild_check(interaction: discord.Interaction) -> bool:
+        return bool(interaction.guild and interaction.guild.name == _COUNCIL_GUILD)
+
+    async def _council_save_image(
+        self,
+        interaction: discord.Interaction,
+        image: discord.Attachment,
+        image2: discord.Attachment | None,
+        image3: discord.Attachment | None,
+        captions: list[str],
+        keywords: str,
+        target_user_ids: list[str] | None = None,
+        target_role_ids: list[str] | None = None,
+        log_to_thread: str | None = None,
+    ) -> None:
+        for att, label in [(image, "primary"), (image2, "paired"), (image3, "third")]:
+            if att and (not att.content_type or not att.content_type.startswith("image/")):
+                await interaction.response.send_message(
+                    f"The {label} attachment doesn't look like an image.", ephemeral=True
+                )
+                return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        entry_id = f"{int(time.time())}_{interaction.user.id}"
+        ext = Path(image.filename).suffix.lower() or ".png"
+        dest = _COUNCIL_DIR / f"{entry_id}{ext}"
+        _COUNCIL_DIR.mkdir(parents=True, exist_ok=True)
+
+        try:
+            await image.save(dest)
+        except Exception as exc:
+            log.exception("Failed to save council image.")
+            await interaction.followup.send(f"❌ Failed to save image: {exc}", ephemeral=True)
+            return
+
+        extra_paths: list[str] = []
+        for idx, att in enumerate([image2, image3], 2):
+            if att:
+                ext_n = Path(att.filename).suffix.lower() or ".png"
+                dest_n = _COUNCIL_DIR / f"{entry_id}_img{idx}{ext_n}"
+                try:
+                    await att.save(dest_n)
+                    extra_paths.append(str(dest_n))
+                except Exception as exc:
+                    log.exception("Failed to save council image %d.", idx)
+                    await interaction.followup.send(f"❌ Failed to save image {idx}: {exc}", ephemeral=True)
+                    return
+
+        clean_captions = [c.strip() for c in captions if c.strip()]
+        clean_keywords = [k.strip().lower() for k in keywords.split(",") if k.strip()]
+        data = _council_load()
+        entry: dict = {
+            "id": entry_id,
+            "path": str(dest),
+            "captions": clean_captions,
+            "keywords": clean_keywords,
+            "target_users": target_user_ids or [],
+            "target_roles": target_role_ids or [],
+            "submitted_by": interaction.user.display_name,
+            "submitter_id": str(interaction.user.id),
+            "submitted_at": int(time.time()),
+        }
+        if extra_paths:
+            entry["extra_paths"] = extra_paths
+            entry["paired_path"] = extra_paths[0]  # backward compat
+        data.append(entry)
+        _council_save(data)
+        cap_note = f" with {len(clean_captions)} caption(s)" if clean_captions else ""
+        kw_note = f" and {len(clean_keywords)} keyword(s)" if clean_keywords else ""
+        pair_note = f" + {len(extra_paths)} additional image(s)" if extra_paths else ""
+        log.info("Council submission #%d from %s%s%s%s.", len(data), interaction.user.display_name, cap_note, kw_note, pair_note)
+        await interaction.followup.send(
+            f"✅ Image submitted{cap_note}{kw_note}{pair_note}. Council has **{len(data)}** submission(s).",
+            ephemeral=True,
+        )
+        if log_to_thread and interaction.guild:
+            all_image_paths = [dest] + [Path(p) for p in extra_paths]
+            log_msg = f"the council has received the following evidence from {interaction.user.mention}"
+            asyncio.create_task(
+                self._post_to_council_thread(
+                    interaction.guild, log_to_thread, log_msg,
+                    file_paths=all_image_paths,
+                ),
+                name="council-evidence-log",
+            )
+
+    # ── /howard councilsubmission ─────────────────────────────────────────────
+
+    @chaos.command(name="councilsubmission", description="Submit an image to the council.")
+    @app_commands.describe(
+        image="Primary image to submit.",
+        image2="Optional second image — posted below the primary.",
+        image3="Optional third image.",
+        caption="Caption 1.",
+        caption2="Caption 2.",
+        keywords="Comma-separated keywords. Prioritized when Howard replies to a matching message.",
+    )
+    async def councilsubmission_cmd(
+        self, interaction: discord.Interaction,
+        image: discord.Attachment,
+        image2: discord.Attachment | None = None,
+        image3: discord.Attachment | None = None,
+        caption: str = "",
+        caption2: str = "",
+        keywords: str = "",
+    ) -> None:
+        if not self._council_guild_check(interaction):
+            await interaction.response.send_message("Council is not available in this server.", ephemeral=True)
+            return
+        await self._council_save_image(
+            interaction, image, image2=image2, image3=image3,
+            captions=[caption, caption2],
+            keywords=keywords,
+            log_to_thread="council log: evidence",
+        )
+
+    # ── /howard counciltestimony ──────────────────────────────────────────────
+
+    @chaos.command(name="counciltestimony", description="Submit text or a link to the council.")
+    @app_commands.describe(
+        link="Optional URL to submit.",
+        caption="Testimony text.",
+        caption2="Caption 2.",
+        caption3="Caption 3.",
+        caption4="Caption 4.",
+        caption5="Caption 5.",
+        keywords="Comma-separated keywords. Prioritized when Howard replies to a matching message.",
+    )
+    async def counciltestimony_cmd(
+        self, interaction: discord.Interaction,
+        link: str = "",
+        caption: str = "",
+        caption2: str = "",
+        caption3: str = "",
+        caption4: str = "",
+        caption5: str = "",
+        keywords: str = "",
+    ) -> None:
+        if not self._council_guild_check(interaction):
+            await interaction.response.send_message("Council is not available in this server.", ephemeral=True)
+            return
+
+        clean_link = link.strip()
+        clean_captions = [c.strip() for c in [caption, caption2, caption3, caption4, caption5] if c.strip()]
+
+        if not clean_link and not clean_captions:
+            await interaction.response.send_message(
+                "Provide a link or at least one caption.", ephemeral=True
+            )
+            return
+
+        clean_keywords = [k.strip().lower() for k in keywords.split(",") if k.strip()]
+        data = _council_load()
+        entry_id = f"{int(time.time())}_{interaction.user.id}"
+
+        is_yt = bool(re.match(r"^https?://(?:www\.|m\.)?(?:youtube\.com/|youtu\.be/)", clean_link, re.IGNORECASE))
+        if clean_link and is_yt:
+            entry: dict = {
+                "id": entry_id,
+                "video_url": clean_link,
+                "captions": clean_captions,
+                "keywords": clean_keywords,
+                "target_users": [],
+                "target_roles": [],
+                "submitted_by": interaction.user.display_name,
+                "submitter_id": str(interaction.user.id),
+                "submitted_at": int(time.time()),
+            }
+            kind = "Video"
+        else:
+            if clean_link:
+                clean_captions = [clean_link] + clean_captions
+            entry = {
+                "id": entry_id,
+                "reply_text": True,
+                "captions": clean_captions,
+                "keywords": clean_keywords,
+                "target_users": [],
+                "target_roles": [],
+                "submitted_by": interaction.user.display_name,
+                "submitter_id": str(interaction.user.id),
+                "submitted_at": int(time.time()),
+            }
+            kind = "Text"
+
+        data.append(entry)
+        _council_save(data)
+        cap_note = f" ({len(clean_captions)} caption(s))" if clean_captions else ""
+        kw_note = f" and {len(clean_keywords)} keyword(s)" if clean_keywords else ""
+        log.info("Council testimony #%d from %s%s%s.", len(data), interaction.user.display_name, cap_note, kw_note)
+        await interaction.response.send_message(
+            f"✅ {kind} testimony submitted{cap_note}{kw_note}. Council has **{len(data)}** submission(s).",
+            ephemeral=True,
+        )
+
+    # ── /howard councilpresident ──────────────────────────────────────────────
+
+    @chaos.command(name="councilpresident", description="View council submissions or add a targeted entry.")
+    @app_commands.default_permissions()
+    @app_commands.describe(
+        view="Send a text log of all council submissions.",
+        image="Image to submit.",
+        image2="Optional paired image.",
+        image3="Optional third image.",
+        url="YouTube URL to submit.",
+        text="Text reply to submit.",
+        caption="Caption 1.",
+        caption2="Caption 2.",
+        caption3="Caption 3.",
+        caption4="Caption 4.",
+        caption5="Caption 5.",
+        keywords="Comma-separated keywords.",
+        target_user="Deploy only to this user.",
+        target_user2="Deploy only to this user.",
+        target_user3="Deploy only to this user.",
+        target_role="Deploy only to members of this role.",
+        target_role2="Deploy only to members of this role.",
+    )
+    async def councilpresident_cmd(
+        self, interaction: discord.Interaction,
+        view: bool = False,
+        image: discord.Attachment | None = None,
+        image2: discord.Attachment | None = None,
+        image3: discord.Attachment | None = None,
+        url: str = "",
+        text: str = "",
+        caption: str = "", caption2: str = "", caption3: str = "",
+        caption4: str = "", caption5: str = "",
+        keywords: str = "",
+        target_user: discord.Member | None = None,
+        target_user2: discord.Member | None = None,
+        target_user3: discord.Member | None = None,
+        target_role: discord.Role | None = None,
+        target_role2: discord.Role | None = None,
+    ) -> None:
+        if settings.owner_id is None or interaction.user.id != settings.owner_id:
+            await interaction.response.send_message("Not authorized.", ephemeral=True)
+            return
+        if not self._council_guild_check(interaction):
+            await interaction.response.send_message("Council is not available in this server.", ephemeral=True)
+            return
+
+        if view:
+            data = _council_load()
+            if not data:
+                await interaction.response.send_message("No council submissions yet.", ephemeral=True)
+                return
+            col_sub = max((len(e.get("submitted_by", "unknown")) for e in data), default=7)
+            header = f"{'#':<5} {'TYPE':<6} {'SUBMITTED BY':<{col_sub + 2}} {'TIMESTAMP (UTC)':<18} PREVIEW"
+            divider = "-" * max(len(header), 60)
+            rows = [f"COUNCIL SUBMISSIONS — {len(data)} total", divider, header, divider]
+            for i, e in enumerate(data, 1):
+                kind = "[img]" if e.get("path") else ("[vid]" if e.get("video_url") else "[txt]")
+                submitter = e.get("submitted_by", "unknown")
+                ts = e.get("submitted_at")
+                timestamp = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if ts else "unknown"
+                targeted = " *" if (e.get("target_users") or e.get("target_roles")) else "  "
+                first = (e.get("captions") or [""])[0] or e.get("video_url", "")
+                preview = first[:50]
+                rows.append(f"#{i:<4} {kind}  {submitter:<{col_sub + 2}} {timestamp:<18}{targeted} {preview}")
+            rows += ["", "* = targeted entry"]
+            buf = io.BytesIO("\n".join(rows).encode())
+            await interaction.response.send_message(
+                f"**{len(data)} council submission(s):**",
+                file=discord.File(buf, filename="council_submissions.txt"),
+                ephemeral=True,
+            )
+            return
+
+        target_user_ids = [str(u.id) for u in [target_user, target_user2, target_user3] if u]
+        target_role_ids = [str(r.id) for r in [target_role, target_role2] if r]
+
+        if image:
+            await self._council_save_image(
+                interaction, image, image2=image2, image3=image3,
+                captions=[caption, caption2, caption3, caption4, caption5],
+                keywords=keywords,
+                target_user_ids=target_user_ids,
+                target_role_ids=target_role_ids,
+            )
+        elif url.strip():
+            if not re.match(r"^https?://(?:www\.|m\.)?(?:youtube\.com/|youtu\.be/)", url, re.IGNORECASE):
+                await interaction.response.send_message("Please provide a valid YouTube URL.", ephemeral=True)
+                return
+            clean_captions = [c.strip() for c in [caption, caption2, caption3, caption4, caption5] if c.strip()]
+            clean_keywords = [k.strip().lower() for k in keywords.split(",") if k.strip()]
+            data = _council_load()
+            entry_id = f"{int(time.time())}_{interaction.user.id}"
+            entry: dict = {
+                "id": entry_id,
+                "video_url": url.strip(),
+                "captions": clean_captions,
+                "keywords": clean_keywords,
+                "target_users": target_user_ids,
+                "target_roles": target_role_ids,
+                "submitted_by": interaction.user.display_name,
+                "submitter_id": str(interaction.user.id),
+                "submitted_at": int(time.time()),
+            }
+            data.append(entry)
+            _council_save(data)
+            cap_note = f" with {len(clean_captions)} caption(s)" if clean_captions else ""
+            await interaction.response.send_message(
+                f"✅ Targeted video submitted{cap_note}. Council has **{len(data)}** submission(s).",
+                ephemeral=True,
+            )
+        elif text.strip():
+            clean_keywords = [k.strip().lower() for k in keywords.split(",") if k.strip()]
+            data = _council_load()
+            entry_id = f"{int(time.time())}_{interaction.user.id}"
+            entry = {
+                "id": entry_id,
+                "reply_text": True,
+                "captions": [text.strip()],
+                "keywords": clean_keywords,
+                "target_users": target_user_ids,
+                "target_roles": target_role_ids,
+                "submitted_by": interaction.user.display_name,
+                "submitter_id": str(interaction.user.id),
+                "submitted_at": int(time.time()),
+            }
+            data.append(entry)
+            _council_save(data)
+            await interaction.response.send_message(
+                f"✅ Targeted text submitted. Council has **{len(data)}** submission(s).",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "Provide an image, a YouTube URL, text — or set view=True to see all submissions.",
+                ephemeral=True,
+            )
+
+    # ── /howard invokecouncil ─────────────────────────────────────────────────
+
+    @chaos.command(name="invokecouncil", description="Summon a submission from the council. Leave entry blank for random.")
+    @app_commands.describe(entry="Specific submission to post (leave blank for random).")
+    async def invokecouncil_cmd(self, interaction: discord.Interaction, entry: str = "") -> None:
+        is_owner = settings.owner_id is not None and interaction.user.id == settings.owner_id
+        if entry and not is_owner:
+            entry = ""
+        if not self._council_guild_check(interaction):
+            await interaction.response.send_message("The council is not available in this server.", ephemeral=True)
+            return
+        council = _council_load()
+        valid = [e for e in council if self._council_is_valid(e)]
+        if not valid:
+            await interaction.response.send_message("The council has no submissions yet.", ephemeral=True)
+            return
+        if entry:
+            chosen = next((e for e in valid if e["id"] == entry), None)
+            if chosen is None:
+                await interaction.response.send_message("Entry not found.", ephemeral=True)
+                return
+        else:
+            chosen = random.choice(valid)
+        caption = _pick_council_caption(chosen)
+        if chosen.get("video_url"):
+            content = f"{caption}\n{chosen['video_url']}" if caption else chosen["video_url"]
+            await interaction.response.send_message(content=content)
+        elif chosen.get("reply_text"):
+            if not caption:
+                await interaction.response.send_message("That entry has no text.", ephemeral=True)
+                return
+            await interaction.response.send_message(content=caption)
+        else:
+            files = [discord.File(Path(chosen["path"]))]
+            for extra in chosen.get("extra_paths", []):
+                if Path(extra).exists():
+                    files.append(discord.File(Path(extra)))
+            if not chosen.get("extra_paths"):
+                paired = chosen.get("paired_path")
+                if paired and Path(paired).exists():
+                    files.append(discord.File(Path(paired)))
+            await interaction.response.send_message(content=caption, files=files)
+
+    @invokecouncil_cmd.autocomplete("entry")
+    async def _invokecouncil_entry_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        if settings.owner_id is None or interaction.user.id != settings.owner_id:
+            return []
+        council = _council_load()
+        choices = []
+        for i, e in enumerate(council, 1):
+            if not self._council_is_valid(e):
+                continue
+            label = self._council_entry_label(i, e)
+            if current.lower() not in label.lower():
+                continue
+            choices.append(app_commands.Choice(name=label, value=e["id"]))
+            if len(choices) >= 25:
+                break
+        return choices
+
 
 async def setup(bot: commands.Bot) -> None:
     cog = VoiceChaos(bot)
     await bot.add_cog(cog)
-    cog.chaos.add_command(CouncilGroup(bot))

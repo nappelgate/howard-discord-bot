@@ -67,6 +67,8 @@ class MusicGroup(app_commands.Group):
         self.bot = bot
         self._queues: dict[int, deque[Track]] = {}
         self._now_playing: dict[int, Track] = {}
+        # (ytdl_proc, ffmpeg_proc) per guild — killed on stop/skip
+        self._procs: dict[int, tuple[subprocess.Popen, subprocess.Popen]] = {}
 
     # ── saved URL library ────────────────────────────────────────────────────
 
@@ -91,14 +93,16 @@ class MusicGroup(app_commands.Group):
         loop = asyncio.get_event_loop()
 
         def _extract_meta(search_url: str) -> dict:
-            result = subprocess.run(
-                [_YTDLP_BIN,
-                 "--cookies-from-browser", "chrome",
-                 "--js-runtimes", f"node:{_NODE_BIN}",
-                 "-J", "--quiet", "--no-warnings", search_url],
-                capture_output=True, text=True, timeout=60,
-            )
-            if result.returncode not in (0, 1) or not result.stdout.strip():
+            base_args = [_YTDLP_BIN, "--js-runtimes", f"node:{_NODE_BIN}",
+                         "-J", "--quiet", "--no-warnings"]
+            for extra in (["--cookies-from-browser", "chrome"], []):
+                result = subprocess.run(
+                    base_args + extra + [search_url],
+                    capture_output=True, text=True, timeout=60,
+                )
+                if result.returncode in (0, 1) and result.stdout.strip():
+                    break
+            else:
                 raise RuntimeError(result.stderr.strip() or "yt-dlp returned no metadata.")
             info = json.loads(result.stdout)
             if "entries" in info:
@@ -122,9 +126,16 @@ class MusicGroup(app_commands.Group):
             duration=info.get("duration"),
         )
 
+    def _kill_procs(self, guild_id: int) -> None:
+        procs = self._procs.pop(guild_id, ())
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+
     def _advance(self, guild_id: int, error: Exception | None = None) -> None:
         if error:
             log.error("Playback error in guild %d: %s", guild_id, error)
+        self._kill_procs(guild_id)
         asyncio.run_coroutine_threadsafe(self._start_next(guild_id), self.bot.loop)
 
     async def _start_next(self, guild_id: int) -> None:
@@ -140,42 +151,26 @@ class MusicGroup(app_commands.Group):
         track = q.popleft()
         self._now_playing[guild_id] = track
 
-        # Re-fetch stream URL + headers fresh (avoids stale pre-signed URLs).
-        # Use the CLI with browser cookies so YouTube hands back a web-client URL
-        # that ffmpeg can actually open — no pipe, no seekability issues.
-        loop = asyncio.get_event_loop()
-        def _fresh_stream() -> tuple[str, dict]:
-            result = subprocess.run(
-                [_YTDLP_BIN,
-                 "--cookies-from-browser", "chrome",
-                 "--js-runtimes", f"node:{_NODE_BIN}",
-                 "-j", "--quiet", "--no-warnings", track.webpage_url],
-                capture_output=True, text=True, timeout=60,
-            )
-            if not result.stdout.strip():
-                raise RuntimeError(result.stderr.strip() or "yt-dlp returned no stream info")
-            info = json.loads(result.stdout)
-            if "entries" in info:
-                info = info["entries"][0]
-            return info["url"], info.get("http_headers", {})
-
-        try:
-            stream_url, headers = await loop.run_in_executor(None, _fresh_stream)
-        except Exception as exc:
-            log.error("Failed to fetch stream for '%s': %s — skipping.", track.title, exc)
-            await self._start_next(guild_id)
-            return
-
-        header_str = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
-        before_opts = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-        if header_str:
-            before_opts = f"-headers '{header_str}' {before_opts}"
+        # yt-dlp pipes audio to FFmpegPCMAudio via stdin.
+        # Force webm/opus output — it's a proper streaming container (no seeking needed).
+        # FFmpegPCMAudio manages its own ffmpeg process and fires `after` reliably.
+        ytdl = subprocess.Popen(
+            [_YTDLP_BIN,
+             "--js-runtimes", f"node:{_NODE_BIN}",
+             "-f", "bestaudio[ext=webm]/bestaudio[acodec=opus]/bestaudio",
+             "-o", "-", "--quiet", "--no-warnings",
+             track.webpage_url],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        self._procs[guild_id] = (ytdl,)
 
         source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(stream_url, before_options=before_opts, options="-vn"),
+            discord.FFmpegPCMAudio(ytdl.stdout, pipe=True, options="-vn"),
             volume=0.5,
         )
         if not guild.voice_client:
+            self._kill_procs(guild_id)
             return
         guild.voice_client.play(source, after=lambda e: self._advance(guild_id, e))
         log.info("Now playing in guild %d: %s", guild_id, track.title)
@@ -253,6 +248,7 @@ class MusicGroup(app_commands.Group):
         guild_id = interaction.guild.id
         self._queues.pop(guild_id, None)
         self._now_playing.pop(guild_id, None)
+        self._kill_procs(guild_id)
         await vc.disconnect()
         await interaction.response.send_message("Stopped.", ephemeral=True)
 
@@ -360,4 +356,4 @@ async def setup(bot: commands.Bot) -> None:
     if not voice_cog:
         raise RuntimeError("VoiceChaos must be loaded before music")
     voice_cog.chaos.add_command(MusicGroup(bot))
-    log.info("Music subgroup attached to /howard.")
+    log.info("Music subgroup attached to /%s.", voice_cog.chaos.name)

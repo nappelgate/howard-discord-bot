@@ -13,7 +13,7 @@ import os
 import discord
 from discord.ext import commands
 
-from config import settings
+from config import ENV_FILE, settings
 
 # libopus is not in the system library path (installed without Homebrew).
 # Load it explicitly from the venv so voice encoding works.
@@ -27,11 +27,13 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("chaosbot")
+log.info("Settings file: %s", ENV_FILE)
 
 # Intents: message_content and members are privileged intents — both must also
 # be enabled in the Discord Developer Portal (Bot tab -> Privileged Gateway Intents).
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = settings.privileged_intents
+intents.members = settings.privileged_intents
 
 
 class ChaosBot(commands.Bot):
