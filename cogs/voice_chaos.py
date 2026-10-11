@@ -470,6 +470,8 @@ class VoiceChaos(commands.Cog):
         await interaction.response.send_modal(AmendmentModal(self, entry["id"]))
 
     async def cog_load(self) -> None:
+        if settings.follow_bot_id is None:
+            self.chaos.remove_command("tagalong")
         if settings.enable_voice:
             self._task = asyncio.create_task(self._loop(), name="voice-chaos-loop")
         if settings.enable_gaslight:
@@ -654,9 +656,9 @@ class VoiceChaos(commands.Cog):
             if (
                 settings.follow_bot_id is not None
                 and member.id == settings.follow_bot_id
-                and random.random() < settings.follow_chance
+                and random.random() < settings.tagalong_chance
             ):
-                asyncio.create_task(self._follow_raid(after.channel), name="follow-raid")
+                asyncio.create_task(self._tagalong_raid(after.channel), name="tagalong-raid")
             return
         if not settings.enable_join_sounds:
             return
@@ -830,14 +832,14 @@ class VoiceChaos(commands.Cog):
         log.info("Raiding '%s' (%s) with '%s'.", channel.name, channel.guild.name, sound.name)
         await self._play_clip(channel, sound)
 
-    async def _follow_raid(self, channel: discord.VoiceChannel) -> None:
-        """Tag along when the followed bot (Howard) joins a voice channel."""
+    async def _tagalong_raid(self, channel: discord.VoiceChannel) -> None:
+        """Tagalong: join and raid a channel the followed bot just joined."""
         await asyncio.sleep(random.uniform(1.0, 4.0))
         sounds = self._list_sounds()
         if not sounds or (self._chill_until and time.monotonic() < self._chill_until):
             return
         sound = random.choice(sounds)
-        log.info("Following into '%s' with '%s'.", channel.name, sound.name)
+        log.info("Tagalong into '%s' with '%s'.", channel.name, sound.name)
         await self._play_clip(channel, sound)
 
     async def _play_clip(self, channel: discord.VoiceChannel, sound: Path) -> bool:
@@ -1855,6 +1857,30 @@ class VoiceChaos(commands.Cog):
         await interaction.response.send_message(
             f"🔊 Volume set to **{level:.2f}** — takes effect on the next clip.",
             ephemeral=True,
+        )
+
+    @chaos.command(
+        name="tagalong",
+        description="View or set the tagalong chance: odds of joining when the followed bot joins voice. Admin only to set.",
+    )
+    @app_commands.describe(percent="Chance from 0 to 100. Omit to see the current value.")
+    @app_commands.check(_full_only)
+    async def tagalong_cmd(
+        self, interaction: discord.Interaction, percent: app_commands.Range[float, 0, 100] | None = None
+    ) -> None:
+        if percent is None:
+            await interaction.response.send_message(
+                f"🐾 Tagalong chance: **{settings.tagalong_chance * 100:g}%**", ephemeral=True
+            )
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Admins only, sorry.", ephemeral=True)
+            return
+        settings.tagalong_chance = percent / 100
+        self._write_env("TAGALONG_CHANCE", f"{settings.tagalong_chance:g}")
+        log.info("Tagalong chance set to %g%% by %s.", percent, interaction.user)
+        await interaction.response.send_message(
+            f"🐾 Tagalong chance set to **{percent:g}%**.", ephemeral=True
         )
 
     @chaos.command(

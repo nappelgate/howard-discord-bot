@@ -6,7 +6,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
-# ENV_FILE lets a second bot (Son of Howard) run this same codebase with its own settings.
+# ENV_FILE lets a second bot account run this same codebase with its own settings.
 ENV_FILE = Path(os.getenv("ENV_FILE") or BASE_DIR / ".env")
 load_dotenv(ENV_FILE)
 
@@ -82,11 +82,11 @@ class Settings:
         # in the Developer Portal must set this false or login fails.
         self.privileged_intents = _bool("PRIVILEGED_INTENTS", True)
 
-        # Follow another bot (Howard) into voice: when it joins a channel, raid
-        # that channel too with this probability.
+        # Tagalong: when the bot with FOLLOW_BOT_ID joins a voice channel,
+        # this bot joins and raids it too with probability TAGALONG_CHANCE (0.0–1.0).
         _follow_raw = os.getenv("FOLLOW_BOT_ID", "").strip()
         self.follow_bot_id: int | None = int(_follow_raw) if _follow_raw.isdigit() else None
-        self.follow_chance = _float("FOLLOW_CHANCE", 0.05)
+        self.tagalong_chance = _float("TAGALONG_CHANCE", 0.05)
 
         # Owner's Discord user ID — gates privileged commands.
         _owner_raw = os.getenv("OWNER_ID", "").strip()
