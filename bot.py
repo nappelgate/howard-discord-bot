@@ -49,6 +49,8 @@ class ChaosBot(commands.Bot):
         await self.load_extension("cogs.voice_chaos")
         await self.load_extension("cogs.message_chaos")
         await self.load_extension("cogs.music")
+        if settings.enable_riot:
+            await self.load_extension("cogs.riot")
         log.info("Cogs loaded.")
 
     async def _sync_commands(self) -> None:

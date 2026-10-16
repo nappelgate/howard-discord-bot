@@ -92,6 +92,18 @@ class Settings:
         _owner_raw = os.getenv("OWNER_ID", "").strip()
         self.owner_id: int | None = int(_owner_raw) if _owner_raw.isdigit() else None
 
+        # Riot Games API (ARAM Mayhem damage outliers). Disabled if no key is set.
+        self.riot_api_key = os.getenv("RIOT_API_KEY", "").strip()
+        self.enable_riot = _bool("ENABLE_RIOT", True) and bool(self.riot_api_key)
+        self.riot_channel_name = os.getenv("RIOT_CHANNEL_NAME", "damage-charts").strip() or "damage-charts"
+        self.riot_poll_seconds = max(60.0, _float("RIOT_POLL_SECONDS", 240.0))
+        self.riot_queue_id = int(_float("RIOT_QUEUE_ID", 2400))  # ARAM: Mayhem
+        self.riot_min_game_seconds = _float("RIOT_MIN_GAME_SECONDS", 300.0)
+        self.riot_high_lobby = _float("RIOT_HIGH_LOBBY_RATIO", 1.75)
+        self.riot_high_team = _float("RIOT_HIGH_TEAM_RATIO", 2.0)
+        self.riot_low_lobby = _float("RIOT_LOW_LOBBY_RATIO", 0.35)
+        self.riot_low_team = _float("RIOT_LOW_TEAM_RATIO", 0.30)
+
 
         # Sanity: keep min <= max.
         if self.voice_min_interval > self.voice_max_interval:
